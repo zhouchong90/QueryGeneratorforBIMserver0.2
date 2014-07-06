@@ -13,44 +13,157 @@ import org.bimserver.models.ifc2x3tc1.*;
 
 public class Query implements QueryInterface {
 
+	/**
+	 * Output path for the OSM file
+	 * @author Nan Yu
+	 */
 	private String outputPath;
+	
+	/**
+	 * All output content, generated in generateOutput function
+	 * @author Nan Yu
+	 */
 	private StringBuffer outputContent = new StringBuffer();
-	private IfcProduct currentInstance; 		//current instance
+	
+	/**
+	 * Current analyzed instance, the value could be wall, floor, roof, window, door
+	 * @author Nan Yu
+	 */
+	private IfcProduct currentInstance; 		
+	
+	/**
+	 * Wall and its OSM relation map, used by OSM surface-subsurface relation
+	 * @author Nan Yu
+	 * //TODO clear up this information. Use it with internalSurfaceMap.
+	 */
 	private Map<IfcWall, OSMSurface> wallOSMSurfaceMap = new HashMap<IfcWall, OSMSurface>(); 
-						//wall and its OSM relation map, used by OSM surface-subsurface relation
+					
+	/**
+	 * @author Nan Yu
+	 */
 	private Map<IfcWall, List<OSMSubSurface>> unLinkedOSMSubSurfacesMap = new HashMap<IfcWall, List<OSMSubSurface>>();
 						//if sub-surface occurs before surface, add to unLinkedOSMSubSurfaces
+	
+	/**
+	 * All points, incrementally added from IFC Points. Used to generate the space name in sequence
+	 * @author Nan Yu
+	 */
 	private List<OSMPoint> allOSMPoints = new ArrayList<OSMPoint>();			//all surface/subsurface points in order to transform the units and replace close ones
-	private List<OSMSpace> allSpaces = new ArrayList<OSMSpace>();	//all spaces
-	private int surfaceNum = 0;	//surface number
+	
+	/**
+	 * All spaces, incrementally added from IFCSpace. Used to generate the space name in sequence
+	 * @author Nan Yu
+	 */
+	private List<OSMSpace> allSpaces = new ArrayList<OSMSpace>();
+	
+	/**
+	 * A 1 to 2 mapping from IfcWall to OSMSurface to store duplicated internal walls.
+	 * @author Chong Zhou
+	 */
+	private HashMap<IfcWall, List<OSMSurface>> internalSurfaceMap = new HashMap<IfcWall,List<OSMSurface>>();
+	
+	/**
+	 * @author Nan Yu
+	 */
+	private int surfaceNum = 0;
 
+	
+	/**
+	 * Main entrance of the project
+	 * @param model
+	 * @param out
+	 * @author Nan Yu
+	 */
 	@Override
 	public void query(IfcModelInterface model, PrintWriter out) {
+		//Get all spaces from the IFC model
 		List<IfcSpace> ifcSpaceList = model.getAll(IfcSpace.class);
+		
 		for (IfcSpace ifcSpace : ifcSpaceList) {
 			extractSpaces(ifcSpace);
 		}
 
+		//Calculate the unit conversion scale
 		double scale = calUnitConvScale(model);
+		
+		//Convert the units
 		transformUnits(scale);
+		
+		//Add linkage information to internal Walls
+		addLinkageInformation();
+		
+		//Generate OSM Output Content
 		generateOutput();
+		
+		//Save output to file
 		saveOutputToFile(model.getName());
 	}
 	
+	/**
+	 * For internal wall, we link the duplicated walls to each other by outsideboundaryConditionObject
+	 * @author Chong Zhou
+	 */
+	private void addLinkageInformation()
+	{
+		for(List<OSMSurface> surfaceList: internalSurfaceMap.values())
+		{
+			// check if each internal wall is shared by 2 spaces.
+			if (surfaceList.size() == 2)
+			{
+				String surface0 = surfaceList.get(0).getSurfaceName();
+				String surface1 = surfaceList.get(1).getSurfaceName();
+				surfaceList.get(0).setOutsideBoundaryConditionObject(surface1);
+				surfaceList.get(1).setOutsideBoundaryConditionObject(surface0);
+				System.err.println("Success:"+surface0);
+			}
+			else
+			{
+				System.err.println("Error: internal wall matching not equal to 2!");
+				System.err.println("size:" + surfaceList.size());
+				System.err.println("firstName:" + surfaceList.get(0).getSurfaceName());
+			}
+		}
+	}
+	
+	/**
+	 * Analyze every IFCSpace and create OSMSpace accordingly
+	 * @param ifcSpace
+	 * @author Nan Yu
+	 */
 	private void extractSpaces(IfcSpace ifcSpace){
+		
 		currentInstance = ifcSpace;
-		System.out.println("ifcSpace name is " + ifcSpace.getName());
-
+		
+		//Create the temporary OSMSpace object
 		OSMSpace osmSpace = new OSMSpace();
+		
+		//Assign a name to the OSMSpace
 		osmSpace.setSpaceName("sp-" + (allSpaces.size() + 1) + "-Space");
-//		osmSpace.setSpaceName("sp-" + (allSpaces.size() + 1) + "-Space-" + ifcSpace.getName()); // to be replaced by the line above!!!!
+		
+		/**
+		 * Obsolete code
+		 * @author Nan Yu.
+		 * osmSpace.setSpaceName("sp-" + (allSpaces.size() + 1) + "-Space-" + ifcSpace.getName());  to be replaced by the line above!!!!
+		 */
 
+		//Get all related space boundary objects (including surfaces, subsurfaces)
 		List<IfcRelSpaceBoundary> ifcRelSpaceBoundaryList = ifcSpace.getBoundedBy();
+		
+		//TODO what does this means?
 		wallOSMSurfaceMap.clear();
+		
+		//for every space bounary such as wall, ceiling or floor
 		for (IfcRelSpaceBoundary ifcRelSpaceBoundary : ifcRelSpaceBoundaryList) {
+			
+			//get the related ifc element of the space boundary to see if it's a wall or floor, etc.
 			IfcElement ifcElement = ifcRelSpaceBoundary.getRelatedBuildingElement();
+			
+			//TODO edit: get the connection geometry points of the space boundary
 			IfcConnectionGeometry ifcConnectionGeometry = ifcRelSpaceBoundary.getConnectionGeometry();
+			
 			if (ifcConnectionGeometry != null && ifcElement != null) {
+				
+				//extract the space boundary information such as wall, ceiling and floor.
 				extractRelatedElement(ifcElement, ifcConnectionGeometry, osmSpace);
 			}
 		}
@@ -82,8 +195,17 @@ public class Query implements QueryInterface {
 		return scale;
 	}
 	
+	/**
+	 * Extract the connection geometry
+	 * @param ifcConnectionGeometry the connection geometry of the space
+	 * @param spaceBoundaryPointList an empty point list of the connection geometry
+	 * @return
+	 * @author Nan Yu
+	 */
 	private boolean extractSpaceBoundary(IfcConnectionSurfaceGeometry ifcConnectionGeometry, List<OSMPoint> spaceBoundaryPointList){
+		//TODO what does this mean?
 		boolean isGeometrySolved = false;
+		
 		IfcSurfaceOrFaceSurface ifcSurfaceOrFaceSurface = ifcConnectionGeometry.getSurfaceOnRelatingElement();
 		if(ifcSurfaceOrFaceSurface instanceof IfcCurveBoundedPlane){
 			IfcCurveBoundedPlane ifcCurveBoundedPlane = (IfcCurveBoundedPlane) ifcSurfaceOrFaceSurface;
@@ -100,6 +222,7 @@ public class Query implements QueryInterface {
 		return isGeometrySolved;
 	}
 	
+	//TODO: might miss one translation
 	private boolean extractCurveBoundedPlaneSB(IfcCurveBoundedPlane ifcCurveBoundedPlane, List<OSMPoint> spaceBoundaryPointList){
 		boolean isGeometrySolved = false;
 		try{
@@ -125,6 +248,7 @@ public class Query implements QueryInterface {
 		return isGeometrySolved;
 	}
 	
+	//TODO: might miss one translation
 	private boolean extractSurfaceOfLinearExtrusionSB(IfcSurfaceOfLinearExtrusion ifcSurfaceOfLinearExtrusion, List<OSMPoint> spaceBoundaryPointList){
 		boolean isGeometrySolved = false;
 		try{
@@ -169,9 +293,24 @@ public class Query implements QueryInterface {
 		return isGeometrySolved;
 	}
 	
+	/**
+	 * Extract all properties of the related building element
+	 * @param ifcElement the space boundary element. It could be wall, ceiling, floor, window, door, etc.
+	 * @param ifcConnectionGeometry the connecting geometry points of the connection points of the space boundary
+	 * @param osmSpace current OSMSpace to be analyzed
+	 * @author Nan Yu
+	 */
 	private void extractRelatedElement(IfcElement ifcElement, IfcConnectionGeometry ifcConnectionGeometry, OSMSpace osmSpace){
+		
+		//initiate the connecting point list
 		List<OSMPoint> spaceBoundaryPointList = new ArrayList<OSMPoint>();
+		
+		//Extract the connection geometry, ifcConnectionGeometry is an abstract class, ifcConnectionSurfaceGeometry is a subtype of it.
 		boolean isGeometrySolved = extractSpaceBoundary((IfcConnectionSurfaceGeometry)ifcConnectionGeometry, spaceBoundaryPointList);
+		
+		//Extract Other Properties
+		
+		//Wall, surface
 		if (ifcElement instanceof IfcWall) {
 			if(isGeometrySolved){
 				IfcWall ifcWall = (IfcWall) ifcElement;
@@ -190,7 +329,7 @@ public class Query implements QueryInterface {
 							if(ifcPropertySingleValue.getName().equals("IsExternal")){
 								Tristate isExternal = ((IfcBoolean)ifcPropertySingleValue.getNominalValue()).getWrappedValue();
 								if(isExternal.getValue() == 0){		//true
-									osmSurface.setOutsideBoundaryCondition("Outdoors");
+									osmSurface.setOutsideBoundaryCondition("Outdoors"); 	//TODO: Chong!!!!! confirmed with mechanical engineers, Ke or OpenStudio teams
 									osmSurface.setSunExposure("SunExposed");
 									osmSurface.setWindExposure("WindExposed");
 								}
@@ -198,6 +337,17 @@ public class Query implements QueryInterface {
 									osmSurface.setOutsideBoundaryCondition("Surface");
 									osmSurface.setSunExposure("NoSun");
 									osmSurface.setWindExposure("NoWind");
+									
+									if(internalSurfaceMap.containsKey(ifcWall))
+									{
+										internalSurfaceMap.get(ifcWall).add(osmSurface);
+									}
+									else
+									{
+										ArrayList<OSMSurface> surfaceList = new ArrayList<OSMSurface>();
+										surfaceList.add(osmSurface);
+										internalSurfaceMap.put(ifcWall,surfaceList);
+									}		
 								}
 								else{
 									System.err.println("Error: invalid value of isExternal!!");
@@ -230,6 +380,8 @@ public class Query implements QueryInterface {
 				System.err.println("Error: unparsed geometry representation of wall!");
 			}
 		}
+		
+		//Slab, surface
 		else if(ifcElement instanceof IfcSlab){ 
 			if(isGeometrySolved){
 				IfcSlab ifcSlab = (IfcSlab) ifcElement;
@@ -237,7 +389,7 @@ public class Query implements QueryInterface {
 	        	osmSurface.setSurfaceName("su-" + (++surfaceNum));
 //	        	osmSurface.setSurfaceName("su-" + (++surfaceNum) + "-" + ifcElement.getName());	//this line should be replaced by the line above!!!!
 	    		osmSurface.setOSMSpace(osmSpace);
-	    		osmSurface.setOutsideBoundaryCondition("Ground");
+	    		osmSurface.setOutsideBoundaryCondition("Ground");			//TODO: Chong!!!!! confirmed with mechanical engineers, Ke or OpenStudio teams
 	    		osmSurface.setSunExposure("NoSun");
 	    		osmSurface.setWindExposure("NoWind");
 	    		
@@ -262,6 +414,8 @@ public class Query implements QueryInterface {
 				System.err.println("Error: unparsed geometry representation of slab!");
 			}
         } 
+		
+		//Roof, Surface
 		else if(ifcElement instanceof IfcRoof){ 
 			if(isGeometrySolved){
 				IfcRoof ifcRoof = (IfcRoof) ifcElement;
@@ -284,7 +438,7 @@ public class Query implements QueryInterface {
 									osmSurface.setSunExposure("SunExposed");
 									osmSurface.setWindExposure("WindExposed");
 								}
-								else if(isExternal.getValue() == 1){	//false
+								else if(isExternal.getValue() == 1){	//false					//TODO: Chong!!!!! confirmed with mechanical engineers, Ke or OpenStudio teams
 									osmSurface.setOutsideBoundaryCondition("Surface");
 									osmSurface.setSunExposure("NoSun");
 									osmSurface.setWindExposure("NoWind");
@@ -310,6 +464,8 @@ public class Query implements QueryInterface {
 				System.err.println("Error: unparsed geometry representation of roof!");
 			}
         }
+		
+		//Window, subsurface
 		else if(ifcElement instanceof IfcWindow){ 
 			if(isGeometrySolved){
 				IfcWindow ifcWindow = (IfcWindow) ifcElement;
@@ -324,7 +480,7 @@ public class Query implements QueryInterface {
 						osmSubSurface.addOSMPoint(osmPoint);
 						allOSMPoints.add(osmPoint);
 					}
-					
+					//TODO: Chong!!!!! confirmed with mechanical engineers, Ke or OpenStudio teams
 					OSMSurface osmSurface = wallOSMSurfaceMap.get(ifcRelatingBuildingElement);	//add (IfcWall) cast before ifcRelatingBuildingElement
 					if(osmSurface != null){
 						osmSubSurface.setOSMSurface(osmSurface);
@@ -344,6 +500,8 @@ public class Query implements QueryInterface {
 				System.err.println("Error: unparsed geometry representation of window!");
 			}
         }
+		
+		//Door subsurface
         else if(ifcElement instanceof IfcDoor){ 
         	if(isGeometrySolved){
         		IfcDoor ifcDoor = (IfcDoor) ifcElement;
@@ -358,7 +516,7 @@ public class Query implements QueryInterface {
     					osmSubSurface.addOSMPoint(osmPoint);
     					allOSMPoints.add(osmPoint);
     				}
-    				
+    				//TODO: Chong!!!!! confirmed with mechanical engineers, Ke or OpenStudio teams
     				OSMSurface osmSurface = wallOSMSurfaceMap.get(ifcRelatingBuildingElement);	//add (IfcWall) cast before ifcRelatingBuildingElement
     				if(osmSurface != null){
     					osmSubSurface.setOSMSurface(osmSurface);
@@ -412,7 +570,7 @@ public class Query implements QueryInterface {
 			outputContent.append(",                         ! Z Origin {m}\n  ");
 			outputContent.append(osmSpace.getBuildingStoreyName());
 			outputContent.append(",                         ! Building Story Name\n  ");
-			outputContent.append(osmSpace.getSpaceName());
+			outputContent.append(osmSpace.getSpaceName());///???problem why is thermal zone the same as space name?
 			outputContent.append(" ThermalZone;  ! Thermal Zone Name\n\n");
 		}
 		
@@ -429,7 +587,7 @@ public class Query implements QueryInterface {
 				outputContent.append(",             ! Space Name\n  ");
 				outputContent.append(osmSurface.getOutsideBoundaryCondition());
 				outputContent.append(",                 ! Outside Boundary Condition\n  ");
-				outputContent.append(osmSurface.getOutsideBoudaryConditionObject());
+				outputContent.append(osmSurface.getOutsideBoundaryConditionObject());
 				outputContent.append(",                         ! Outside Boundary Condition Object\n  ");
 				outputContent.append(osmSurface.getSunExposure());
 				outputContent.append(",               ! Sun Exposure\n  ");
@@ -474,7 +632,7 @@ public class Query implements QueryInterface {
 					outputContent.append(",                         ! Construction Name\n  ");
 					outputContent.append(osmSubSurface.getOSMSurface().getSurfaceName());
 					outputContent.append(",                  ! Surface Name\n  ");
-					outputContent.append(osmSubSurface.getOutsideBoudaryConditionObject());
+					outputContent.append(osmSubSurface.getOutsideBoundaryConditionObject());
 					outputContent.append(",                         ! Outside Boundary Condition Object\n  ");
 					outputContent.append(osmSubSurface.getViewFactorToGround());
 					outputContent.append(",                         ! View Factor to Ground\n  ");
@@ -522,6 +680,10 @@ public class Query implements QueryInterface {
 		}
 	}
 	
+	/**
+	 * Saving output buffer to file.
+	 * @param modelName
+	 */
 	private void saveOutputToFile(String modelName){
 		Properties property = System.getProperties();    
 		String osName = property.getProperty("os.name");    
@@ -638,6 +800,11 @@ public class Query implements QueryInterface {
 		return absOSMPoint;
 	}
 
+	/**
+	 * Point contains double x,y,z values.
+	 * @author Nan Yu
+	 *
+	 */
 	class OSMPoint{
 		private Double x;
 		private Double y;
@@ -692,13 +859,18 @@ public class Query implements QueryInterface {
 		}
 	}
 
+	/**
+	 * Surface includes wall, slab and roof. It includes a list of points defining the geometry and a list of OSMSubSurface.
+	 * @author Nan Yu
+	 *
+	 */
 	class OSMSurface{
 		private String surfaceName = "";
 		private String typeName = "";
 		private String constructionName = "";
 		private OSMSpace osmSpace = null;
 		private String outsideBoundaryCondition = "";
-		private String outsideBoudaryConditionObject = "";
+		private String outsideBoundaryConditionObject = "";
 		private String sunExposure = "";
 		private String windExposure = "";
 		private String viewFactorToGround = "";
@@ -735,12 +907,12 @@ public class Query implements QueryInterface {
 		public void setOutsideBoundaryCondition(String outsideBoundaryCondition) {
 			this.outsideBoundaryCondition = outsideBoundaryCondition;
 		}
-		public String getOutsideBoudaryConditionObject() {
-			return outsideBoudaryConditionObject;
+		public String getOutsideBoundaryConditionObject() {
+			return outsideBoundaryConditionObject;
 		}
-		public void setOutsideBoudaryConditionObject(
-				String outsideBoudaryConditionObject) {
-			this.outsideBoudaryConditionObject = outsideBoudaryConditionObject;
+		public void setOutsideBoundaryConditionObject(
+				String outsideBoundaryConditionObject) {
+			this.outsideBoundaryConditionObject = outsideBoundaryConditionObject;
 		}
 		public String getSunExposure() {
 			return sunExposure;
@@ -780,12 +952,16 @@ public class Query implements QueryInterface {
 		}
 	}
 
+	/**
+	 * Sub surface including windows and doors etc. It include a list of OSMPoint defining the geometry.
+	 * @author Nan Yu
+	 */
 	class OSMSubSurface{
 		private String subSurfaceName = "";
 		private String typeName = "";
 		private String constructionName = "";
 		private OSMSurface osmSurface = null;
-		private String outsideBoudaryConditionObject = "";
+		private String outsideBoundaryConditionObject = "";
 		private String viewFactorToGround = "";
 		private String shadingControlName = "";
 		private String frameAndDividerName = "";
@@ -816,12 +992,12 @@ public class Query implements QueryInterface {
 		public void setOSMSurface(OSMSurface osmSurface) {
 			this.osmSurface = osmSurface;
 		}
-		public String getOutsideBoudaryConditionObject() {
-			return outsideBoudaryConditionObject;
+		public String getOutsideBoundaryConditionObject() {
+			return outsideBoundaryConditionObject;
 		}
-		public void setOutsideBoudaryConditionObject(
-				String outsideBoudaryConditionObject) {
-			this.outsideBoudaryConditionObject = outsideBoudaryConditionObject;
+		public void setOutsideBoundaryConditionObject(
+				String outsideBoundaryConditionObject) {
+			this.outsideBoundaryConditionObject = outsideBoundaryConditionObject;
 		}
 		public String getViewFactorToGround() {
 			return viewFactorToGround;
@@ -861,6 +1037,11 @@ public class Query implements QueryInterface {
 		}
 	}
 	
+	/**
+	 * Spaces are rooms , the top of the hierachy and contain a list of OSMSurface.
+	 * @author Nan Yu
+	 *
+	 */
 	class OSMSpace{
 		private boolean containsUnsolvedSurface = false;
 		private String spaceName = "";
@@ -871,7 +1052,7 @@ public class Query implements QueryInterface {
 		private String xOrigin = "";
 		private String yOrigin = "";
 		private String zOrigin = "";
-		private String buildingStoreyName = "";
+		private String buildingStoryName = "";
 		private String thermalZoneName = "";
 		private List<OSMSurface> surfaceList = new ArrayList<OSMSurface>();
 		
@@ -930,10 +1111,10 @@ public class Query implements QueryInterface {
 			this.zOrigin = zOrigin;
 		}
 		public String getBuildingStoreyName() {
-			return buildingStoreyName;
+			return buildingStoryName;
 		}
 		public void setBuildingStoreyName(String buildingStoreyName) {
-			this.buildingStoreyName = buildingStoreyName;
+			this.buildingStoryName = buildingStoreyName;
 		}
 		public String getThermalZoneName() {
 			return thermalZoneName;
